@@ -1,0 +1,227 @@
+---
+title: PR Lens
+emoji: 🔍
+colorFrom: blue
+colorTo: purple
+sdk: gradio
+sdk_version: 5.0.0
+app_file: app.py
+pinned: false
+---
+
+# 🔍 PR Lens
+
+> Multi-agent GitHub PR summarizer and code reviewer powered by the OpenAI Agents SDK.
+
+---
+
+## What it does
+
+Paste any public GitHub PR URL. PR Lens runs a pipeline of specialized AI agents that analyze the PR in parallel — summarizing what changed, scanning for security issues, and reviewing code quality. A synthesis agent assembles the findings into a structured review report, streams it live into the Gradio UI, and optionally emails it via SendGrid.
+
+---
+
+## OpenAI Agents SDK features demonstrated
+
+| Feature | Where |
+|---|---|
+| `Agent` with system prompt | Every agent in the pipeline |
+| `Runner.run_streamed()` | Single streamed run in `run_triage()` — live activity in Gradio |
+| `Runner.run()` | Each specialist called inside `asyncio.gather` |
+| `@function_tool` | `get_pr_metadata`, `run_all_specialists`, `send_email` |
+| `asyncio.gather` | Inside `run_all_specialists` — all 3 specialists fire in parallel |
+| `handoff()` | Triage Agent → Synthesis Agent baton pass |
+| `input_guardrail` | Rejects non-GitHub-PR URLs before any LLM token consumed |
+| `output_guardrail` | Enforces verdict field present on `ReviewReport` |
+| `RunContextWrapper[PRContext]` | Typed PR context flows through entire run |
+| `output_type=ReviewReport` | Synthesis returns typed Pydantic model with `markdown_report` field |
+
+---
+
+## Architecture
+
+```
+User pastes PR URL
+        │
+        ▼
+   run_triage()   ← single Runner.run_streamed call
+        │
+        ├── input_guardrail           validates URL before any LLM token
+        │
+        ├── get_pr_metadata           @function_tool — fetches title, author,
+        │                             head_sha, file counts from GitHub API
+        │
+        ├── run_all_specialists       @function_tool wrapping asyncio.gather
+        │     ├── summary_agent       Runner.run() — what changed & why
+        │     ├── security_agent      Runner.run() — vulnerabilities & risks
+        │     └── quality_agent       Runner.run() — complexity, duplication, naming
+        │           (all 3 run simultaneously — wall time = slowest one)
+        │
+        └── handoff(synthesis_agent)  LLM passes specialist JSON to synthesis
+                  │
+                  ├── output_guardrail    enforces verdict field present
+                  ├── fills ReviewReport  structured Pydantic output
+                  │     ├── verdict
+                  │     ├── verdict_reason
+                  │     ├── markdown_report  ← LLM generates via Field description
+                  │     └── email_html       ← LLM generates via Field description
+                  └── send_email        @function_tool — sends via SendGrid
+                            │
+                            ▼
+                   report.markdown_report → Gradio display
+```
+
+---
+
+## Project structure
+
+```
+pr_lens/
+├── app.py                      # Gradio UI — single markdown output, simple pattern
+├── .env                        # OPENAI_API_KEY, SENDGRID_API_KEY, SENDGRID_FROM/TO_EMAIL
+├── requirements.txt
+│
+├── pr_agents/                  # renamed from agents/ to avoid conflict with openai-agents SDK
+│   ├── triage_agent.py         # Orchestrator — guardrail, @function_tool, asyncio.gather, handoff
+│   ├── summary_agent.py        # Specialist — SummaryOutput (Pydantic)
+│   ├── security_agent.py       # Specialist — SecurityOutput (Pydantic)
+│   ├── quality_agent.py        # Specialist — QualityOutput (Pydantic)
+│   └── synthesis_agent.py      # Handoff target — ReviewReport, output_guardrail, send_email
+│
+├── tools/
+│   ├── github_tools.py         # @function_tool — get_pr_metadata, get_pr_diff,
+│   │                           #                  get_changed_files, read_file_content
+│   └── email_tools.py          # @function_tool — send_email (SendGrid)
+│
+├── models/
+│   └── schemas.py              # Pydantic models: PRContext, SummaryOutput, SecurityOutput,
+│                               #   QualityOutput, ReviewReport (with markdown_report field)
+│
+└── utils/
+    └── pr_parser.py            # Parses GitHub PR URLs → PRDetails dataclass
+```
+
+---
+
+## Key design decisions
+
+**Why `pr_agents/` not `agents/`**
+The OpenAI Agents SDK package is called `agents`. Naming the folder `agents/` causes a Python import conflict. Renamed to `pr_agents/`.
+
+**Why `@function_tool` wraps `asyncio.gather`**
+The LLM cannot call tools in parallel — it reasons sequentially. By wrapping `asyncio.gather` inside a single `@function_tool`, the LLM calls one tool and Python controls the parallelism internally. Total analysis time ≈ slowest single agent, not the sum of all three.
+
+**Why `output_type=ReviewReport` not `output_type=str`**
+The `output_guardrail` checks `output.verdict` directly on a typed Pydantic field — no string parsing, no guessing. The `markdown_report` and `email_html` fields are generated by the LLM via `Field(description=...)` — same pattern as `ReportData.markdown_report` in Ed Donner's LLM course.
+
+**Why the guardrail receives a list not a string**
+The OpenAI Agents SDK converts `Runner.run_streamed(input="...")` into a messages list `[{"role": "user", "content": "..."}]` internally before passing to the guardrail. The guardrail extracts the string content from `input[-1].get("content", "")`.
+
+**Public GitHub API only**
+No authentication required. Rate limited to 60 requests/hour unauthenticated — sufficient for a POC. Works with any public GitHub repository.
+
+---
+
+## Setup
+
+### 1. Clone and install
+
+```bash
+git clone https://github.com/yourname/pr_lens.git
+cd pr_lens
+pip install -r requirements.txt
+```
+
+### 2. Configure environment
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env`:
+
+```
+OPENAI_API_KEY=sk-...
+SENDGRID_API_KEY=SG....              # optional — only needed for email
+SENDGRID_FROM_EMAIL=you@example.com  # optional
+SENDGRID_TO_EMAIL=you@example.com    # optional
+```
+
+### 3. Run
+
+```bash
+python app.py
+# or
+uv run app.py
+```
+
+Open [http://localhost:7860](http://localhost:7860) in your browser.
+
+---
+
+## Usage
+
+Paste any public GitHub PR URL and click **Analyze**:
+
+```
+https://github.com/fastapi/fastapi/pull/1
+https://github.com/owner/repo/pull/123
+owner/repo#123
+```
+
+The Gradio UI streams live agent activity as the pipeline runs, then renders the final structured report.
+
+---
+
+## Sample output
+
+```
+## 📋 fastapi/fastapi#1 — Add tests for path endpoints
+**Author:** tiangolo | **Files:** 2 | **+523 / -0**
+
+---
+### 📝 Summary
+**Complexity:** medium
+
+This PR adds tests for path parameter constraints including min/max length,
+greater than, and less than validations. New endpoints were added to
+tests/main.py with corresponding test cases in tests/test_path.py.
+
+**Why:** Improve test coverage for path parameter validation.
+**Key files:** tests/main.py, tests/test_path.py
+
+---
+### 🔒 Security Review
+_No security vulnerabilities identified in the test additions._
+
+✅ No security issues found.
+
+---
+### 🧹 Code Quality
+_Minor duplication in test patterns, otherwise well structured._
+
+⚠️ **duplication** — `tests/test_path.py`
+   Repeated JSON assertion patterns across test functions.
+   💡 _Extract a shared assertion helper._
+
+---
+### 🏁 Verdict: 🔁 Request Changes
+
+Code duplication in test patterns should be addressed before merging.
+```
+
+---
+
+## Tech stack
+
+- [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/)
+- [Gradio](https://gradio.app/) — UI
+- [GitHub REST API](https://docs.github.com/en/rest) — public PR data, no auth required
+- [SendGrid](https://sendgrid.com/) — optional email delivery
+- [Pydantic](https://docs.pydantic.dev/) — structured outputs
+
+---
+
+## License
+
+MIT
