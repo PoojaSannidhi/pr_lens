@@ -1,5 +1,5 @@
 ---
-title: PR Lens
+title: pr-lens
 emoji: 🔍
 colorFrom: blue
 colorTo: purple
